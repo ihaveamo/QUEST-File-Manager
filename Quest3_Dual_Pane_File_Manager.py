@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Quest 3 Dual-Pane File Manager — Windows / Python 3.9+, standard library only.
 Author - Michael Forde
-Ver - 1.1
+Ver - 1.5
 
 Local PC (left) <-> Meta Quest using Android Debug Bridge (right).
 
 - Expandable, lazy-loaded directory trees (Ctrl/Shift multi-selection).
-- Recursive ADB push/pull, preserving the name and hierarchy of each folder.
+- Recursive ADB push/pull; same-named destination folders are merged, not duplicated.
+- Reliably uploads protected Android/data/obb folders file by file via ADB,
+  avoiding recursive adb push secure_mkdirs failures; keeps overall progress.
+- Pre-creates Quest upload directories via adb shell mkdir -p (ADB secure_mkdirs workaround).
 - Target = selected destination folder, or parent of a selected destination file.
 - Deliberately separate directional transfer and deletion buttons.
 - Confirmation for all deletions and transfers that may overwrite existing files.
 - Runs long operations off the Tkinter UI thread and can cancel a transfer.
 - Shows live ADB transfer percentages in the log and progress bar.
+- Installs a selected APK from either pane onto the connected Quest, with confirmation and detailed logging.
 
 ADB is automatically located beside this script, in a nearby platform-tools
 folder (including the earlier Quest Storage Explorer layout), or on PATH.
@@ -29,10 +33,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
@@ -99,6 +106,133 @@ def target_folder(entry: FileEntry, side: str) -> str:
     if entry.kind == "dir":
         return entry.path
     return os.path.dirname(entry.path) if side == "local" else posixpath.dirname(entry.path)
+
+
+def transfer_destination_for_item(source: str, entry: FileEntry, destination: str) -> tuple[str, bool]:
+    """Return the directory to pass to ADB and whether it merges a named folder.
+
+    ADB copies a source *directory* beneath its destination directory. When a
+    user selects a directory called GM8E01 on both sides, passing GM8E01 as
+    the ADB destination would incorrectly create GM8E01/GM8E01. Instead pass
+    the selected directory's parent, so ADB merges with the existing GM8E01.
+    For other folder names, retain the original create-subfolder behaviour.
+    """
+    if source not in ("local", "quest"):
+        raise ValueError("Invalid transfer direction")
+    if entry.kind != "dir":
+        return destination, False
+    if source == "local":  # destination is an Android POSIX directory
+        normalized = normalize_remote(destination)
+        same_name = entry.name == posixpath.basename(normalized)
+        parent = posixpath.dirname(normalized)
+    else:  # destination is a local PC directory
+        normalized = os.path.normpath(destination)
+        name = os.path.basename(normalized)
+        same_name = os.path.normcase(entry.name) == os.path.normcase(name)
+        parent = os.path.dirname(normalized)
+    if same_name and parent and parent != normalized:
+        return parent, True
+    return destination, False
+
+
+def remote_upload_directories(local_folder: str, remote_folder: str) -> list[str]:
+    """Build remote directories to pre-create for a recursive ADB folder push.
+
+    ADB push can fail in its own secure_mkdirs path even if an explicit Android
+    shell mkdir would work. Using mkdir -p for all directories also covers
+    subfolders inside texture packs, not just their root folder.
+    """
+    local_root = Path(local_folder)
+    if not local_root.is_dir():
+        raise RuntimeError(f"PC source folder is no longer available: {local_folder}")
+    remote_root = normalize_remote(remote_folder)
+    result = [remote_root]
+
+    def onerror(error: OSError) -> None:
+        raise error
+
+    for parent, dirs, _files in os.walk(local_folder, followlinks=False, onerror=onerror):
+        # Do not pre-create target trees for symlink directories. This also
+        # prevents an accidental walk beyond the chosen local folder.
+        dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+        for name in dirs:
+            relative = Path(parent, name).relative_to(local_root)
+            result.append(posixpath.join(remote_root, *relative.parts))
+    return result
+
+
+
+def is_protected_quest_destination(destination: str) -> bool:
+    """Android app-specific external storage: use single-file ADB uploads here.
+
+    Do not mistake a folder named Android elsewhere in the path for the
+    Android/data or Android/obb directories rooted at shared storage.
+    """
+    normalized = normalize_remote(destination)
+    storage_roots = ("/sdcard", "/storage/emulated/0")
+    return any(normalized.startswith(root + "/Android/data/") or
+               normalized.startswith(root + "/Android/obb/")
+               for root in storage_roots)
+
+
+def enumerate_upload_files(local_folder: str, remote_folder: str) -> list[tuple[str, str, int]]:
+    """Plan file-by-file upload preserving every relative subdirectory.
+
+    Symlinks are ignored (even those pointing to files), avoiding traversal
+    outside the selected folder and accidental unintended uploads.
+    """
+    root = Path(local_folder)
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError(f"PC source folder is not a real directory: {local_folder}")
+    remote_root = normalize_remote(remote_folder)
+    result: list[tuple[str, str, int]] = []
+
+    def onerror(error: OSError) -> None:
+        raise error
+
+    for current, directories, files in os.walk(root, followlinks=False, onerror=onerror):
+        directories[:] = sorted((d for d in directories if not (Path(current) / d).is_symlink()),
+                                key=str.casefold)
+        for filename in sorted(files, key=str.casefold):
+            local = Path(current) / filename
+            if local.is_symlink() or not local.is_file():
+                continue
+            relative = local.relative_to(root)
+            remote = posixpath.join(remote_root, *relative.parts)
+            result.append((str(local), remote, local.stat().st_size))
+    return result
+
+
+def remote_mkdir_batches(paths: list[str], max_length: int = 6500) -> list[str]:
+    """Produce bounded, safely shell-quoted mkdir commands for adb shell -T."""
+    prefix = "mkdir -p -- "
+    batches: list[str] = []
+    command = prefix
+    for path in paths:
+        encoded = shlex.quote(normalize_remote(path))
+        if len(command) + len(encoded) + 1 > max_length and command != prefix:
+            batches.append(command)
+            command = prefix
+        command += encoded + " "
+    if command != prefix:
+        batches.append(command.rstrip())
+    return batches
+
+
+def quest_storage_permission_hint(error: str, source: str, destination: str) -> str:
+    """Explain genuine Quest restrictions without claiming they can be bypassed."""
+    if (source == "local" and
+            ("/Android/data/" in destination or "/Android/obb/" in destination) and
+            any(marker in error.lower() for marker in (
+                "operation not permitted", "permission denied", "secure_mkdirs"
+            ))):
+        return ("\n\nQUEST STORAGE PERMISSION: Android denied a write in protected "
+                "app storage. The file manager cannot override Quest permissions. "
+                "Check that the target folder already exists; if it does and this "
+                "still fails, the headset is blocking this ADB operation. "
+                "Use the game's supported import method or an on-headset "
+                "file manager with access to that app's directory.")
+    return ""
 
 
 def safe_delete_target(entry: FileEntry, side: str) -> bool:
@@ -183,6 +317,8 @@ class FileManager:
         self.dir_state: dict[str, dict[str, str]] = {"local": {}, "quest": {}}
         self.root_nodes: dict[str, list[str]] = {"local": [], "quest": []}
         self.busy = False
+        self.operation_kind: str | None = None
+        self.active_side: str | None = None
         self.stop_transfer = threading.Event()
         self.process_lock = threading.Lock()
         self.active_process: subprocess.Popen | None = None
@@ -248,7 +384,7 @@ class FileManager:
         ttk.Label(outer, text="Operation log (long transfers run in the background):").pack(anchor="w", pady=(3, 3))
         self.log = scrolledtext.ScrolledText(outer, height=5, font=("Consolas", 9), wrap="word", state="disabled")
         self.log.pack(fill="x", expand=False)
-        self._write_log("Select a source on one side and a destination on the other. Ctrl/Shift selects multiple items.")
+        self._write_log("Select a source on one side and a destination on the other. Same-named folders merge. Ctrl/Shift selects multiple items.")
 
     def _build_side(self, parent: ttk.Frame, side: str, col: int, title: str, labelvar: tk.StringVar) -> None:
         frame = ttk.LabelFrame(parent, text=title, padding=8)
@@ -280,6 +416,10 @@ class FileManager:
         tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
         tree.bind("<<TreeviewOpen>>", lambda _evt, s=side: self._open_selected(s))
         tree.bind("<<TreeviewSelect>>", lambda _evt, s=side: self._show_selected(s))
+        # Track which pane the user actually interacted with, even though both
+        # trees retain a selection (e.g. source and destination for transfers).
+        tree.bind("<ButtonPress-1>", lambda _evt, s=side: self._set_active_side(s), add="+")
+        tree.bind("<FocusIn>", lambda _evt, s=side: self._set_active_side(s), add="+")
         self.tree[side] = tree
 
         desc = ttk.Label(frame, textvariable=labelvar, wraplength=480)
@@ -299,7 +439,20 @@ class FileManager:
                                        command=lambda: self.start_transfer("quest"))
         self.download_btn.pack(fill="x", pady=(0, 4))
         ttk.Label(center, text="Quest → PC", anchor="center").pack(fill="x")
-        ttk.Label(center, text="Select source(s)\nand a destination\non opposite sides", justify="center").pack(pady=(45, 0))
+        ttk.Separator(center, orient="horizontal").pack(fill="x", pady=(32, 16))
+        self.install_btn = ttk.Button(center, text="INSTALL APK", style="Action.TButton",
+                                      command=self.install_selected_apk)
+        self.install_btn.pack(fill="x", pady=(0, 6))
+        self.install_hint = tk.StringVar(value="Click one APK on either side")
+        ttk.Label(center, textvariable=self.install_hint, justify="center",
+                  wraplength=180).pack(fill="x")
+        ttk.Label(center, text="For copying: select source(s)\nand a destination\non opposite sides",
+                  justify="center").pack(pady=(24, 0))
+
+    def _set_active_side(self, side: str) -> None:
+        """Install APK uses the last pane explicitly clicked or keyboard-focused."""
+        self.active_side = side
+        self.install_hint.set("Selected pane: PC" if side == "local" else "Selected pane: Quest")
 
     def _make_roots(self) -> None:
         home = str(Path.home())
@@ -504,6 +657,7 @@ class FileManager:
         self.root_nodes["local"].append(node)
         self.tree["local"].item(node, open=True)
         self.tree["local"].selection_set(node)
+        self._set_active_side("local")
         self.tree["local"].see(node)
         self._load_dir("local", node)
 
@@ -520,6 +674,7 @@ class FileManager:
         for node, entry in self.entries["quest"].items():
             if entry.is_dir and entry.path == path:
                 self.tree["quest"].selection_set(node)
+                self._set_active_side("quest")
                 self.tree["quest"].see(node)
                 self.tree["quest"].item(node, open=True)
                 self._load_dir("quest", node)
@@ -528,6 +683,7 @@ class FileManager:
         self.root_nodes["quest"].append(node)
         self.tree["quest"].item(node, open=True)
         self.tree["quest"].selection_set(node)
+        self._set_active_side("quest")
         self.tree["quest"].see(node)
         self._load_dir("quest", node)
 
@@ -568,6 +724,123 @@ class FileManager:
             if not redundant:
                 unique.append(self.entries[side][item])
         return unique
+
+    def install_selected_apk(self) -> None:
+        """Install one selected .apk from the most recently used pane."""
+        if self.busy:
+            messagebox.showinfo("Operation in progress", "Finish or cancel the current operation first.")
+            return
+        if not self.adb or not self.serial:
+            messagebox.showerror("Quest not connected", "Connect the Quest and approve ADB debugging first.")
+            return
+        side = self.active_side
+        if side not in ("local", "quest"):
+            messagebox.showwarning("Select an APK", "Click an APK in either the PC or Quest pane first.")
+            return
+        selected = self._selected_entries(side)
+        if len(selected) != 1 or selected[0].kind != "file" or not selected[0].name.lower().endswith(".apk"):
+            messagebox.showwarning(
+                "Select one APK",
+                f"Select exactly one .apk file in the {'PC' if side == 'local' else 'Quest'} pane.\n"
+                "Folders, shortcuts, and multiple selections cannot be installed.",
+            )
+            return
+        apk = selected[0]
+        if side == "local" and not Path(apk.path).is_file():
+            messagebox.showerror("APK not found", f"This file no longer exists:\n{apk.path}")
+            return
+        if side == "quest":
+            try:
+                normalize_remote(apk.path)
+            except ValueError as exc:
+                messagebox.showerror("Invalid Quest path", str(exc))
+                return
+        source_label = "PC" if side == "local" else "Quest"
+        extra = ("The APK will first be copied into a temporary PC folder, then installed.\n"
+                 "That temporary copy will be removed afterward.\n\n") if side == "quest" else ""
+        if not messagebox.askyesno(
+            "ARE YOU SURE? — Install APK",
+            f"Install this APK onto the connected Quest 3?\n\n"
+            f"Source: {source_label}\n"
+            f"File: {apk.path}\n"
+            f"Device: {self.serial}\n\n"
+            + extra
+            + "ADB will install or update the app (-r), preserving existing app data where Android permits.\n"
+              "Android may reject an incompatible APK, an older version, or a signing-key mismatch.\n"
+              "This installs one APK only; split APKs and separate OBB/data files are not included.\n\n"
+              "Continue?",
+            icon="warning", parent=self.root,
+        ):
+            return
+        self.operation_kind = "install"
+        self._set_busy(True)
+        self.stop_transfer.clear()
+        self._finish_progress_log()
+        self.status.set(f"Preparing APK installation: {apk.name}")
+        self._write_log("=" * 56)
+        self._write_log(f"APK INSTALL START — Source: {source_label}; device: {self.serial}")
+        self._write_log(f"APK source path: {apk.path}")
+        self._write_log("Install options: -r (replace/update, retain app data), -t (allow test APKs)")
+        self.pool.submit(self._install_worker, side, apk)
+
+    def _install_worker(self, source: str, apk: FileEntry) -> None:
+        start = time.monotonic()
+        error: str | None = None
+        cancelled = False
+        try:
+            if source == "quest":
+                # adb install needs a PC-local APK. Downloading to an isolated,
+                # temporary path is more compatible than shell pm install from
+                # shared Android storage (which can be inaccessible to pm).
+                with tempfile.TemporaryDirectory(prefix="quest3_apk_install_") as staging_dir:
+                    local_apk = Path(staging_dir) / "quest_selected.apk"
+                    self.events.put(("install_stage", "Downloading selected Quest APK to temporary PC storage…"))
+                    self.events.put(("log", f"Temporary APK staging: {local_apk}"))
+                    self._run_transfer_command(
+                        [str(self.adb), "-s", self.serial, "pull", "-p", apk.path, str(local_apk)],
+                        1, 1, f"Downloading {apk.name}", error_label="ADB APK staging download",
+                    )
+                    if self.stop_transfer.is_set():
+                        raise RuntimeError("Installation cancelled after APK download.")
+                    self._install_local_apk(local_apk, apk.name)
+                self.events.put(("log", "Temporary APK staging folder cleaned up."))
+            else:
+                self._install_local_apk(Path(apk.path), apk.name)
+        except Exception as exc:
+            if self.stop_transfer.is_set():
+                cancelled = True
+            else:
+                error = str(exc)
+        finally:
+            self.events.put(("install_done", source, apk.path, time.monotonic() - start, cancelled, error))
+
+    def _install_local_apk(self, local_apk: Path, display_name: str) -> None:
+        if self.stop_transfer.is_set():
+            raise RuntimeError("Installation cancelled before ADB install.")
+        self.events.put(("install_stage", f"Checking APK: {display_name}"))
+        if not local_apk.is_file():
+            raise RuntimeError(f"APK file not found: {local_apk}")
+        size = local_apk.stat().st_size
+        self.events.put(("log", f"APK size: {size:,} bytes ({size / (1024 * 1024):.2f} MiB)"))
+        if not zipfile.is_zipfile(local_apk):
+            raise RuntimeError("Selected .apk is not a valid ZIP/APK container (or the download is incomplete).")
+        self.events.put(("log", "APK archive format: valid ZIP container (package compatibility checked by Android)."))
+        if self.stop_transfer.is_set():
+            raise RuntimeError("Installation cancelled before ADB install.")
+        self.events.put(("install_stage", f"Installing on Quest: {display_name}…"))
+        self.events.put(("log", f"Executing: adb -s {self.serial} install -r -t <selected APK>"))
+        # -r updates matching packages without clearing app data; -t permits
+        # Android packages flagged android:testOnly (useful for development).
+        output = self._run_transfer_command(
+            [str(self.adb), "-s", self.serial, "install", "-r", "-t", str(local_apk)],
+            1, 1, f"Installing {display_name}", error_label="ADB APK installation",
+        )
+        if self.stop_transfer.is_set():
+            raise RuntimeError("Installation cancelled; the final Android package state is unknown.")
+        if not any(re.match(r"^Success\b", line.strip()) for line in output):
+            raise RuntimeError("ADB exited without an explicit installation 'Success' response. "
+                               "Review the ADB output in the log before assuming it installed.")
+        self.events.put(("log", "Android package manager confirmed: Success"))
 
     def start_transfer(self, source: str) -> None:
         if self.busy:
@@ -613,16 +886,156 @@ class FileManager:
         listed = "\n".join("• " + e.name for e in sources[:8])
         if len(sources) > 8:
             listed += f"\n… and {len(sources) - 8} more"
+        matching_folders = [entry.name for entry in sources
+                            if transfer_destination_for_item(source, entry, destination)[1]]
+        merge_note = (
+            "Matching folder detected: contents will merge into the selected folder "
+            "(no duplicate nested folder).\n\n"
+        ) if matching_folders else ""
+        protected_note = (
+            "Note: The Quest destination is under Android/data or Android/obb. "
+            "The headset may prohibit some writes even when folders are visible.\n\n"
+        ) if target == "quest" and (
+            "/Android/data/" in destination or "/Android/obb/" in destination
+        ) else ""
+        safe_mode_note = (
+            "Protected Quest folder: the app will create directory structure first, "
+            "then transfer each file individually to avoid ADB recursive-copy errors. "
+            "The progress percentage will cover the entire selected folder.\n\n"
+        ) if target == "quest" and is_protected_quest_destination(destination) and any(
+            entry.kind == "dir" for entry in sources
+        ) else ""
         warning = (f"{direction}\n\nSource items:\n{listed}\n\nDestination folder:\n{destination}\n\n"
+                   + merge_note + protected_note + safe_mode_note +
                    "Folders will be copied recursively. If destination files already exist, ADB may overwrite "
                    "them; existing folders may be merged.\n\nProceed?")
         if not messagebox.askyesno("Confirm file transfer", warning, icon="question"):
             return
+        self.operation_kind = "transfer"
         self._set_busy(True)
         self.stop_transfer.clear()
         self.status.set(f"Starting {direction} ({len(sources)} items)…")
         self._write_log(f"START {direction} → {destination} ({len(sources)} top-level items)")
         self.pool.submit(self._transfer_worker, source, sources, destination)
+
+    def _prepare_remote_upload(self, local_folder: str, remote_folder: str) -> str | None:
+        """Try a non-destructive mkdir workaround; preserve original push if denied.
+
+        Returns an explanatory error on mkdir failure. Pre-creation is helpful
+        for ADB's secure_mkdirs regression but cannot override Android access
+        controls, so the caller still tries its normal ADB push.
+        """
+        directories = remote_upload_directories(local_folder, remote_folder)
+        if self.stop_transfer.is_set():
+            raise RuntimeError("Transfer cancelled before destination preparation.")
+        self.events.put(("log", f"PREPARE Quest folder: {remote_folder}"))
+        self.events.put(("log", f"Pre-creating/verifying {len(directories)} Quest director"
+                                    + ("y" if len(directories) == 1 else "ies")
+                                    + " via adb shell mkdir -p"))
+        try:
+            for batch in remote_mkdir_batches(directories):
+                if self.stop_transfer.is_set():
+                    raise RuntimeError("Transfer cancelled during destination preparation.")
+                self._adb_run(["shell", "-T", batch], timeout=60)
+            self.events.put(("log", f"Quest directory preparation OK ({len(directories)} folders)."))
+            return None
+        except Exception as exc:
+            if self.stop_transfer.is_set():
+                raise
+            error = str(exc)
+            self.events.put(("log", "Quest mkdir pre-creation rejected: " + error))
+            self.events.put(("log", "Trying standard ADB push anyway; some devices permit push "
+                                    "even if explicit mkdir is blocked."))
+            return error
+
+    def _upload_protected_folder_files(self, entry: FileEntry, quest_folder: str,
+                                       item_n: int, item_total: int,
+                                       mkdir_error: str | None) -> None:
+        """Transfer a complete selected directory as individual ADB pushes.
+
+        On some Android builds a recursive `adb push <folder>` fails with
+        secure_mkdirs even when the target directory is successfully created,
+        yet `adb push <file>` succeeds. This avoids the recursive ADB path.
+        The top-level progress remains based on bytes across the WHOLE folder.
+        """
+        planned = enumerate_upload_files(entry.path, quest_folder)
+        count = len(planned)
+        total_bytes = sum(size for _, _, size in planned)
+        self.events.put(("log", f"SAFE UPLOAD MODE: {entry.name} -> {quest_folder}"))
+        self.events.put(("log", f"Found {count:,} ordinary files ({total_bytes / (1024 ** 2):,.2f} MiB). "
+                                "Using an individual ADB push for each file."))
+        if not planned:
+            if mkdir_error:
+                raise RuntimeError("Folder has no ordinary files and its Quest directory "
+                                   "could not be created: " + mkdir_error)
+            self.events.put(("transfer_progress", item_n, item_total, entry.name,
+                             100, "(empty folder; directories prepared)", 100))
+            return
+
+        completed_bytes = 0
+        completed_files = 0
+        last_overall = -1
+        last_report_time = 0.0
+        for index, (local_file, remote_file, file_size) in enumerate(planned, 1):
+            if self.stop_transfer.is_set():
+                raise RuntimeError(f"Cancelled after {completed_files}/{count} files.")
+            relative_name = str(Path(local_file).relative_to(Path(entry.path))).replace(os.sep, "/")
+            # Ordinarily pre-created in _prepare_remote_upload. If that failed,
+            # retry mkdir only for this file's parent before pushing it.
+            if mkdir_error:
+                parent = posixpath.dirname(remote_file)
+                try:
+                    self._adb_run(["shell", "-T", "mkdir -p -- " + shlex.quote(parent)], timeout=30)
+                except Exception:
+                    pass  # Actual push reports authoritative success or failure.
+            # Keep the log readable for large texture packs without losing
+            # current-file detail from the live progress entry.
+            if index <= 3 or index == count or index % 25 == 0:
+                self.events.put(("log", f"Uploading file {index:,}/{count:,}: {relative_name}"))
+
+            def on_file_progress(file_pct: int, _adb_name: str, _nested_pct: int | None) -> None:
+                nonlocal last_overall, last_report_time
+                partial = file_size * max(0, min(100, file_pct)) / 100.0
+                if total_bytes:
+                    overall = min(100, int((completed_bytes + partial) * 100 / total_bytes))
+                else:
+                    overall = min(100, int((completed_files + file_pct / 100.0) * 100 / count))
+                now = time.monotonic()
+                if (overall != last_overall and
+                    (now - last_report_time >= 0.14 or overall == 100 or last_report_time == 0)):
+                    last_overall = overall
+                    last_report_time = now
+                    self.events.put(("transfer_progress", item_n, item_total,
+                                     entry.name, overall, relative_name, file_pct))
+
+            remote_parent = posixpath.dirname(remote_file)
+            remote_arg = remote_parent.rstrip("/") + "/"
+            command = [str(self.adb), "-s", self.serial, "push", "-p", local_file, remote_arg]
+            try:
+                self._run_transfer_command(command, item_n, item_total, entry.name,
+                                           progress_hook=on_file_progress,
+                                           suppress_success_output=True)
+            except RuntimeError as exc:
+                # A failed push may leave the current file partially present.
+                hint = quest_storage_permission_hint(str(exc), "local", quest_folder)
+                raise RuntimeError(f"Individual upload failed on file {index:,}/{count:,}: "
+                                   f"{relative_name}\n{exc}{hint}") from exc
+
+            completed_files += 1
+            completed_bytes += file_size
+            new_overall = min(100, int(completed_bytes * 100 / total_bytes)) if total_bytes else int(
+                completed_files * 100 / count)
+            if (new_overall != last_overall or completed_files == count):
+                last_overall = new_overall
+                last_report_time = time.monotonic()
+                self.events.put(("transfer_progress", item_n, item_total,
+                                 entry.name, new_overall, relative_name, 100))
+            if index <= 3 or index == count or index % 25 == 0:
+                self.events.put(("log", f"Uploaded {completed_files:,}/{count:,} files; "
+                                        f"{completed_bytes / (1024 ** 2):,.2f} / "
+                                        f"{total_bytes / (1024 ** 2):,.2f} MiB"))
+        self.events.put(("log", f"SAFE UPLOAD COMPLETE: {completed_files:,}/{count:,} files. "
+                                f"{completed_bytes / (1024 ** 2):,.2f} MiB transferred."))
 
     def _transfer_worker(self, source: str, entries: list[FileEntry], destination: str) -> None:
         done = 0
@@ -634,17 +1047,47 @@ class FileManager:
                     cancelled = True
                     break
                 self.events.put(("transfer_step", n, len(entries), entry.name))
+                adb_destination, merging = transfer_destination_for_item(source, entry, destination)
+                if merging:
+                    self.events.put(("log", f"MERGE existing folder: {entry.name} -> {destination}"))
+                    self.events.put(("log", "Using the parent as ADB's transfer destination "
+                                              "to avoid a duplicated directory level."))
+                mkdir_error: str | None = None
                 if source == "local":
                     if not Path(entry.path).exists():
                         raise RuntimeError(f"Source no longer exists: {entry.path}")
-                    # -p requests progress on older ADB versions; modern ADB
-                    # reports it by default and accepts -p for compatibility.
-                    command = [str(self.adb), "-s", self.serial, "push", "-p", entry.path, destination + "/"]
+                    if entry.kind == "dir":
+                        # For a non-merged upload create <destination>/<folder>;
+                        # for merged uploads adb_destination is the parent, so
+                        # the same calculation still resolves the correct folder.
+                        quest_folder = posixpath.join(adb_destination, entry.name)
+                        mkdir_error = self._prepare_remote_upload(entry.path, quest_folder)
+                    if self.stop_transfer.is_set():
+                        raise RuntimeError("Transfer cancelled before ADB push.")
+                    if entry.kind == "dir" and is_protected_quest_destination(quest_folder):
+                        self._upload_protected_folder_files(entry, quest_folder, n, len(entries), mkdir_error)
+                        done += 1
+                        self.events.put(("log", f"Completed {done}/{len(entries)}: {entry.name}"))
+                        continue
+                    # ADB copies a directory *under* its destination directory.
+                    # -p requests progress on older ADB versions too.
+                    remote_arg = (adb_destination if adb_destination == "/"
+                                  else adb_destination.rstrip("/") + "/")
+                    command = [str(self.adb), "-s", self.serial, "push", "-p", entry.path, remote_arg]
                 else:
-                    if not Path(destination).is_dir():
-                        raise RuntimeError(f"PC destination no longer exists: {destination}")
-                    command = [str(self.adb), "-s", self.serial, "pull", "-p", entry.path, destination]
-                self._run_transfer_command(command, n, len(entries), entry.name)
+                    if not Path(adb_destination).is_dir():
+                        raise RuntimeError(f"PC destination no longer exists: {adb_destination}")
+                    command = [str(self.adb), "-s", self.serial, "pull", "-p", entry.path, adb_destination]
+                self.events.put(("log", f"ADB destination directory: {adb_destination}"))
+                try:
+                    self._run_transfer_command(command, n, len(entries), entry.name)
+                except RuntimeError as exc:
+                    hint = quest_storage_permission_hint(str(exc), source, destination)
+                    diagnostic = ("\n\nEXPLICIT MKDIR RESULT: " + mkdir_error
+                                  if mkdir_error else "")
+                    if hint or diagnostic:
+                        raise RuntimeError(str(exc) + diagnostic + hint) from exc
+                    raise
                 done += 1
                 self.events.put(("log", f"Completed {done}/{len(entries)}: {entry.name}"))
             if self.stop_transfer.is_set():
@@ -658,7 +1101,10 @@ class FileManager:
             self.events.put(("transfer_done", source, destination, done, len(entries), cancelled, error))
 
     def _run_transfer_command(self, command: list[str], item_n: int = 1,
-                              item_total: int = 1, item_name: str = "") -> None:
+                              item_total: int = 1, item_name: str = "",
+                              error_label: str = "ADB transfer",
+                              progress_hook: Callable[[int, str, int | None], None] | None = None,
+                              suppress_success_output: bool = False) -> list[str]:
         """Read ADB output promptly even when progress ends in CR, not LF.
 
         Windows ADB sends live progress on stderr using carriage-return
@@ -693,13 +1139,18 @@ class FileManager:
                 latest_percent, latest_filename, latest_file_percent = parsed
                 # Throttle GUI work; ensure 100% is always delivered.
                 if changed and (now - last_posted >= 0.10 or percentage == 100 or last_posted == 0.0):
-                    self.events.put(("transfer_progress", item_n, item_total, item_name,
-                                     percentage, filename, file_percentage))
+                    if progress_hook is not None:
+                        progress_hook(percentage, filename, file_percentage)
+                    else:
+                        self.events.put(("transfer_progress", item_n, item_total, item_name,
+                                         percentage, filename, file_percentage))
                     last_posted = now
             else:
                 tail.append(line)
                 del tail[:-8]
-                self.events.put(("log", line))
+                if (not suppress_success_output or
+                    "error" in line.lower() or "failed" in line.lower()):
+                    self.events.put(("log", line))
 
         def consume(text: str) -> None:
             nonlocal pending
@@ -729,11 +1180,15 @@ class FileManager:
                 publish(pending)
             code = proc.wait()
             if code:
-                raise RuntimeError("ADB transfer failed (exit code " + str(code) + ").\n" + "\n".join(tail[-5:]))
+                raise RuntimeError(f"{error_label} failed (exit code {code}).\n" + "\n".join(tail[-8:]))
             # Some versions don't emit a final 100%, especially for tiny files.
             if latest_percent is not None and latest_percent != 100:
-                self.events.put(("transfer_progress", item_n, item_total, item_name,
-                                 100, latest_filename, 100 if latest_file_percent is not None else None))
+                if progress_hook is not None:
+                    progress_hook(100, latest_filename, 100 if latest_file_percent is not None else None)
+                else:
+                    self.events.put(("transfer_progress", item_n, item_total, item_name,
+                                     100, latest_filename, 100 if latest_file_percent is not None else None))
+            return tail
         finally:
             with self.process_lock:
                 if self.active_process is proc:
@@ -745,7 +1200,8 @@ class FileManager:
         if not self.busy:
             return
         self.stop_transfer.set()
-        self.status.set("Cancelling transfer…")
+        self.status.set("Cancelling APK installation…" if self.operation_kind == "install"
+                        else "Cancelling operation…")
         with self.process_lock:
             process = self.active_process
             if process is not None and process.poll() is None:
@@ -753,12 +1209,15 @@ class FileManager:
                     process.terminate()
                 except OSError:
                     pass
-        self._write_log("Cancellation requested; partially copied files may remain on the destination.")
+        self._write_log("Cancellation requested. Installation may be incomplete; check the Quest app state."
+                        if self.operation_kind == "install"
+                        else "Cancellation requested; partially copied files may remain on the destination.")
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.upload_btn.configure(state="disabled" if busy else "normal")
         self.download_btn.configure(state="disabled" if busy else "normal")
+        self.install_btn.configure(state="disabled" if busy else "normal")
         self.cancel_btn.configure(state="normal" if busy else "disabled")
         if busy:
             self.progress.configure(mode="indeterminate", value=0)
@@ -766,6 +1225,7 @@ class FileManager:
         else:
             self.progress.stop()
             self.progress.configure(mode="indeterminate", value=0)
+            self.operation_kind = None
 
     def delete_selected(self, side: str) -> None:
         if self.busy:
@@ -794,6 +1254,7 @@ class FileManager:
                                    f"{preview}\n\nAny selected folders and ALL their contents will be deleted recursively. "
                                    "This does NOT use the Recycle Bin and cannot be undone.", icon="warning"):
             return
+        self.operation_kind = "delete"
         self._set_busy(True)
         self.stop_transfer.clear()
         self._write_log(f"DELETE requested on {side}: {len(selected)} items")
@@ -880,6 +1341,13 @@ class FileManager:
                     for node in self.root_nodes["quest"]:
                         if node in self.entries["quest"]:
                             self._load_dir("quest", node, force=True)
+            elif kind == "install_stage":
+                self._finish_progress_log()
+                self.progress.stop()
+                self.progress.configure(mode="indeterminate", value=0)
+                self.progress.start(12)
+                self.status.set(event[1])
+                self._write_log("INSTALL STAGE: " + event[1])
             elif kind == "transfer_step":
                 _, n, total, name = event
                 self._finish_progress_log()
@@ -919,6 +1387,27 @@ class FileManager:
                     self._write_log(f"SUCCESS: {done}/{total} top-level items transferred")
                     messagebox.showinfo("Transfer complete", f"Copied {done} top-level item(s) successfully.")
                 self.refresh_path("quest" if source == "local" else "local", destination)
+            elif kind == "install_done":
+                _, source, path, elapsed, cancelled, err = event
+                self._finish_progress_log()
+                self._set_busy(False)
+                if cancelled:
+                    self.status.set("APK installation cancelled — check app state on Quest")
+                    self._write_log(f"INSTALL CANCELLED after {elapsed:.1f} seconds: {path}")
+                    messagebox.showwarning("Installation cancelled",
+                                           "Installation was cancelled. If Android had already begun installing, "
+                                           "the final app state may need checking on the Quest.")
+                elif err:
+                    self.status.set("APK installation failed")
+                    self._write_log(f"INSTALL FAILED after {elapsed:.1f} seconds: {err}")
+                    messagebox.showerror("APK installation failed", f"APK: {path}\n\n{err}")
+                else:
+                    self.status.set(f"APK installed successfully in {elapsed:.1f}s")
+                    self._write_log(f"INSTALL SUCCESS: {path} ({elapsed:.1f} seconds)")
+                    messagebox.showinfo("APK installed", f"Successfully installed on your Quest 3.\n\n"
+                                        f"Source: {'PC' if source == 'local' else 'Quest'}\n"
+                                        f"APK: {path}\nElapsed: {elapsed:.1f} seconds")
+                self._write_log("=" * 56)
             elif kind == "delete_done":
                 _, side, done, total, paths, errors = event
                 self._set_busy(False)
@@ -935,7 +1424,8 @@ class FileManager:
         if self.busy:
             if not messagebox.askyesno("Operation in progress",
                                        "An operation is still running. Stop the operation and close?\n\n"
-                                       "Partially copied files may remain on the destination."):
+                                       "An APK installation may be left in an unknown state; "
+                                       "partially copied files may remain on the destination."):
                 return
             self.cancel_transfer()
         self._closed = True
